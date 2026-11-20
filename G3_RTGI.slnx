@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Dll1/Dll1.vcxproj" Id="516db192-6072-4f9e-b638-ffba579b00f1" />
+  <Project Path="g3_rtgi_worker/g3_rtgi_worker.vcxproj" Id="4bea983f-a520-4733-a9d0-23a2565fd55b" />
+</Solution>

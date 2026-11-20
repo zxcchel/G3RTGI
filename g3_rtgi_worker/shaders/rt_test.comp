@@ -1,0 +1,157 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D outImage;
+
+layout(push_constant) uniform PushData {
+    mat4 invViewProj;
+    vec4 sunDir;
+    vec4 sunColor;
+    vec4 skyColor;
+    uint width;
+    uint height;
+    uint frameIndex;
+    uint pad;
+} pc;
+
+shared vec3 s_hitPos[8][8];
+
+// Быстрый RNG (PCG)
+uint hash(uint v) {
+    v = v * 747796405u + 2891336453u;
+    uint w = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float rand(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) * (1.0 / 4294967296.0);
+}
+
+// Косинусно-взвешенный вектор в полусфере вокруг нормали N
+vec3 sampleHemisphereCosine(vec3 N, inout uint seed) {
+    float u1 = rand(seed);
+    float u2 = rand(seed);
+    float r = sqrt(u1);
+    float phi = 6.2831853 * u2;
+    vec3 local = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u1)));
+
+    vec3 up = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 T = normalize(cross(up, N));
+    vec3 B = cross(N, T);
+    return normalize(T * local.x + B * local.y + N * local.z);
+}
+
+void main() {
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    uvec2 lid = gl_LocalInvocationID.xy;
+    bool inBounds = (pix.x < pc.width && pix.y < pc.height);
+
+    vec3 origin = vec3(0.0);
+    vec3 dir = vec3(0.0, 0.0, 1.0);
+    bool hit = false;
+    float hitT = 0.0;
+    vec3 hitPos = vec3(0.0);
+
+    if (inBounds) {
+        vec2 uv = (vec2(pix) + 0.5) / vec2(pc.width, pc.height);
+        vec2 ndc = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+
+        vec4 pNear = vec4(ndc, 0.0, 1.0) * pc.invViewProj;
+        vec4 pFar  = vec4(ndc, 1.0, 1.0) * pc.invViewProj;
+        vec3 wNear = pNear.xyz / pNear.w;
+        vec3 wFar  = pFar.xyz  / pFar.w;
+
+        origin = wNear;
+        dir    = normalize(wFar - wNear);
+
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, 0.01, dir, 50000.0);
+        while (rayQueryProceedEXT(rq)) {}
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+            float t = rayQueryGetIntersectionTEXT(rq, true);
+            hitT = t;
+            hitPos = origin + dir * t;
+            hit = true;
+        }
+    }
+
+    s_hitPos[lid.y][lid.x] = hitPos;
+    barrier();
+
+    if (!inBounds) return;
+    if (!hit) {
+        // Белый свет (1.0) и нулевой hitT, чтобы при умножении небо не зачернилось
+        imageStore(outImage, ivec2(pix), vec4(1.0, 1.0, 1.0, 0.0));
+        return;
+    }
+
+    // Геометрическая нормаль по соседним пикселям в workgroup
+    uvec2 lx = uvec2(lid.x < 7u ? lid.x + 1u : lid.x - 1u, lid.y);
+    uvec2 ly = uvec2(lid.x, lid.y < 7u ? lid.y + 1u : lid.y - 1u);
+    vec3 dPdx = (lid.x < 7u) ? (s_hitPos[lx.y][lx.x] - hitPos) : (hitPos - s_hitPos[lx.y][lx.x]);
+    vec3 dPdy = (lid.y < 7u) ? (s_hitPos[ly.y][ly.x] - hitPos) : (hitPos - s_hitPos[ly.y][ly.x]);
+    vec3 N = cross(dPdx, dPdy);
+    float nLen = length(N);
+    N = (nLen > 1e-5) ? (N / nLen) : -dir;
+    if (dot(N, -dir) < 0.0) N = -N;
+
+    // Фоллбэк цветов, если движок не прислал sun/sky
+    vec3 sunDir = length(pc.sunDir.xyz) > 0.1 ? normalize(pc.sunDir.xyz) : normalize(vec3(0.4, 0.8, 0.3));
+    if (sunDir.y < 0.0) sunDir = -sunDir;
+    vec3 sunCol = length(pc.sunColor.rgb) > 0.05 ? pc.sunColor.rgb : vec3(1.0, 0.9, 0.75);
+    vec3 skyCol = length(pc.skyColor.rgb) > 0.05 ? pc.skyColor.rgb : vec3(0.25, 0.40, 0.65);
+
+    // 1. Прямой свет солнца + RT-тень
+    vec3 direct = vec3(0.0);
+    float ndotl = max(dot(N, sunDir), 0.0);
+    if (ndotl > 0.0) {
+        rayQueryEXT sunRq;
+        rayQueryInitializeEXT(sunRq, topLevelAS,
+                              gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                              0xFF, hitPos + N * 3.0, 0.1, sunDir, 30000.0);
+        while (rayQueryProceedEXT(sunRq)) {}
+        if (rayQueryGetIntersectionTypeEXT(sunRq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            direct = sunCol * vec3(1.20, 0.98, 0.72) * ndotl * 3.8;
+        }
+    }
+
+    // 2. Непрямой свет (RTGI: небо + 1-й отскок от солнца)
+    uint seed = pix.x * 1973u + pix.y * 9277u + pc.frameIndex * 26699u;
+    vec3 gi = vec3(0.0);
+    const int SAMPLES = 2;
+
+    for (int s = 0; s < SAMPLES; ++s) {
+        vec3 bDir = sampleHemisphereCosine(N, seed);
+        rayQueryEXT brq;
+        rayQueryInitializeEXT(brq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, hitPos + N * 3.0, 0.1, bDir, 15000.0);
+        while (rayQueryProceedEXT(brq)) {}
+
+        if (rayQueryGetIntersectionTypeEXT(brq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+            float bt = rayQueryGetIntersectionTEXT(brq, true);
+            vec3 bPos = hitPos + N * 3.0 + bDir * bt;
+
+            rayQueryEXT srq;
+            rayQueryInitializeEXT(srq, topLevelAS,
+                                  gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                  0xFF, bPos - bDir * 3.0, 0.1, sunDir, 30000.0);
+            while (rayQueryProceedEXT(srq)) {}
+
+            if (rayQueryGetIntersectionTypeEXT(srq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+                gi += sunCol * vec3(0.75, 0.60, 0.42);
+            }
+        } else {
+            // Холодный свет неба в тенях (контраст к тёплому солнцу)
+            gi += skyCol * vec3(0.45, 0.55, 0.75);
+        }
+    }
+
+    gi /= float(SAMPLES);
+
+    vec3 totalLight = direct + gi;
+    imageStore(outImage, ivec2(pix), vec4(clamp(totalLight, 0.0, 2.0), hitT));
+}
